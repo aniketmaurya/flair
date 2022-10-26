@@ -27,7 +27,7 @@ from torch.optim.lr_scheduler import OneCycleLR  # type: ignore
 
 import flair
 import flair.nn
-from flair.data import Corpus, Dictionary, MultiCorpus, _len_dataset
+from flair.data import Corpus, Dictionary, _len_dataset
 from flair.datasets import DataLoader
 from flair.optim import ExpAnnealLR, LinearSchedulerWithWarmup
 from flair.training_utils import (
@@ -129,7 +129,8 @@ class ModelTrainer:
         Trains any class that implements the flair.nn.Model interface.
         :param base_path: Main path to which all output during training is logged and models are saved  # noqa: E501
         :param learning_rate: Initial learning rate (or max, if scheduler is OneCycleLR)  # noqa: E501
-        :param mini_batch_size: Size of mini-batches during training
+        :param mini_batch_size: Size of mini-batches during training  # noqa: E501
+        :param eval_batch_size: Size of mini-batches during evaluation. Defaults to mini_batch_size.  # noqa: E501
         :param mini_batch_chunk_size: If mini-batches are larger than this number, they get broken down into chunks of this size for processing purposes  # noqa: E501
         :param max_epochs: Maximum number of epochs to train. Terminates training if this number is surpassed.  # noqa: E501
         :param scheduler: The learning rate scheduler to use
@@ -139,6 +140,7 @@ class ModelTrainer:
         :param patience: Patience is the number of epochs with no improvement the Trainer waits  # noqa: E501
          until annealing the learning rate
         :param min_learning_rate: If the (in multi lr case: all) learning rate falls below this threshold, training terminates  # noqa: E501
+        :param initial_extra_patience: Extra patience on top of the base patience value before the first learning rate annealment  # noqa: E501
         :param warmup_fraction: Fraction of warmup steps if the scheduler is LinearSchedulerWithWarmup  # noqa: E501
         :param train_with_dev:  If True, the data from dev split is added to the training data  # noqa: E501
         :param train_with_test: If True, the data from test split is added to the training data  # noqa: E501
@@ -148,9 +150,14 @@ class ModelTrainer:
         'cpu' (embeddings are stored on CPU) or 'gpu' (embeddings are stored on GPU)
         :param save_final_model: If True, final model is saved
         :param anneal_with_restarts: If True, the last best model is restored when annealing the learning rate  # noqa: E501
+        :param anneal_with_prestarts: If True, the model preceding the last best model is restored when annealing the learning rate  # noqa: E501
+        :param anneal_against_dev_loss: If True, the annealment is triggered when dev loss plateaus.  # noqa: E501
+         If False (default), it is triggered when dev score plateaus.
+        :param batch_growth_annealing: If True, mini_batch_size doubles every time learning_rate is annealed.  # noqa: E501
         :param shuffle: If True, data is shuffled during training
         :param param_selection_mode: If True, testing is performed against dev data. Use this mode when doing  # noqa: E501
         parameter selection.
+        :param write_weights: If True, write weights to weights.txt on each batch logging event.
         :param num_workers: Number of workers in your data loader.
         :param sampler: You can pass a data sampler here for special sampling of data.  # noqa: E501
         :param eval_on_train_fraction: the fraction of train data to do the evaluation on,  # noqa: E501
@@ -334,6 +341,9 @@ class ModelTrainer:
                     verbose=True,
                 )
 
+        # Determine whether to log "bad epochs" information
+        log_bad_epochs = True if scheduler.__class__ == AnnealOnPlateau else False
+
         # load existing scheduler state dictionary if it exists
         if scheduler_state_dict:
             scheduler.load_state_dict(scheduler_state_dict)
@@ -500,11 +510,8 @@ class ModelTrainer:
                     for batch_step in batch_steps:
 
                         # forward pass
-                        loss = self.model.forward_loss(batch_step)
-
-                        if isinstance(loss, tuple):
-                            average_over += loss[1]
-                            loss = loss[0]
+                        loss, datapoint_count = self.model.forward_loss(batch_step)
+                        average_over += datapoint_count
 
                         # Backward
                         if use_amp:
@@ -614,13 +621,13 @@ class ModelTrainer:
                         f" ({main_evaluation_metric[0]})"
                         f" {round(train_part_eval_result.main_score, 4)}"
                     )
-                if use_tensorboard:
-                    for (metric_class_avg_type, metric_type) in metrics_for_tensorboard:
-                        writer.add_scalar(
-                            f"train_{metric_class_avg_type}_{metric_type}",
-                            train_part_eval_result.classification_report[metric_class_avg_type][metric_type],
-                            epoch,
-                        )
+                    if use_tensorboard:
+                        for (metric_class_avg_type, metric_type) in metrics_for_tensorboard:
+                            writer.add_scalar(
+                                f"train_{metric_class_avg_type}_{metric_type}",
+                                train_part_eval_result.classification_report[metric_class_avg_type][metric_type],
+                                epoch,
+                            )
 
                 if log_dev:
                     assert self.corpus.dev
@@ -754,7 +761,8 @@ class ModelTrainer:
                         bad_epochs += initial_extra_patience
 
                 # log bad epochs
-                log.info(f"BAD EPOCHS (no improvement): {bad_epochs}")
+                if log_bad_epochs:
+                    log.info(f"BAD EPOCHS (no improvement): {bad_epochs}")
 
                 if loss_txt is not None:
                     # output log file
@@ -762,7 +770,8 @@ class ModelTrainer:
 
                         # make headers on first epoch
                         if epoch == 1:
-                            f.write("EPOCH\tTIMESTAMP\tBAD_EPOCHS" "\tLEARNING_RATE\tTRAIN_LOSS")
+                            bad_epoch_header = "BAD_EPOCHS\t" if log_bad_epochs else ""
+                            f.write(f"EPOCH\tTIMESTAMP\t{bad_epoch_header}LEARNING_RATE\tTRAIN_LOSS")
 
                             if log_train:
                                 f.write("\tTRAIN_" + "\tTRAIN_".join(train_eval_result.log_header.split("\t")))
@@ -781,9 +790,10 @@ class ModelTrainer:
 
                         lr_info = ",".join([f"{lr:.4f}" for lr in current_learning_rate])
 
+                        bad_epoch_info = "\t" + str(bad_epochs) if log_bad_epochs else ""
                         f.write(
                             f"\n{epoch}\t{datetime.datetime.now():%H:%M:%S}"
-                            f"\t{bad_epochs}"
+                            f"{bad_epoch_info}"
                             f"\t{lr_info}\t{train_loss}"
                         )
                         f.write(result_line)
@@ -970,30 +980,12 @@ class ModelTrainer:
             main_evaluation_metric=main_evaluation_metric,
             gold_label_dictionary=gold_label_dictionary_for_eval,
             exclude_labels=exclude_labels,
+            return_loss=False,
         )
 
         log.info(test_results.log_line)
         log.info(test_results.detailed_results)
         log_line(log)
-
-        # if we are training over multiple datasets, do evaluation for each
-        if isinstance(self.corpus, MultiCorpus):
-            for subcorpus in self.corpus.corpora:
-                log_line(log)
-                if subcorpus.test:
-                    subcorpus_results = self.model.evaluate(
-                        subcorpus.test,
-                        gold_label_type=self.model.label_type,
-                        mini_batch_size=eval_mini_batch_size,
-                        num_workers=num_workers,
-                        out_path=base_path / f"{subcorpus.name}-test.tsv",
-                        embedding_storage_mode="none",
-                        main_evaluation_metric=main_evaluation_metric,
-                        gold_label_dictionary=gold_label_dictionary_for_eval,
-                        exclude_labels=exclude_labels,
-                    )
-                    log.info(subcorpus.name)
-                    log.info(subcorpus_results.log_line)
 
         # get and return the final test score of best model
         final_score = test_results.main_score
@@ -1040,9 +1032,7 @@ class ModelTrainer:
                 step += 1
 
                 # forward pass
-                loss = self.model.forward_loss(batch)
-                if isinstance(loss, tuple):
-                    loss = loss[0]
+                loss, datapoint_count = self.model.forward_loss(batch)
 
                 # update optimizer and scheduler
                 optimizer.zero_grad()
